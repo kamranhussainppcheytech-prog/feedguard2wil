@@ -43,6 +43,7 @@ jobs:
         env:
           FEED_URL: ${{ vars.FEED_URL }}
           MAX_REMOVED: ${{ vars.MAX_REMOVED || '100' }}
+          USER_AGENT: ${{ vars.USER_AGENT }}
         run: python feedguard.py ${{ inputs.decision || 'check' }}
 
       - name: Save the record
