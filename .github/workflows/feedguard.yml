@@ -1,0 +1,102 @@
+name: FeedGuard
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      decision:
+        description: 'What do you want to do?'
+        required: true
+        default: 'check'
+        type: choice
+        options:
+          - check
+          - trust
+          - keep
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: feedguard
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install libraries
+        run: pip install requests lxml
+
+      - name: Run the check
+        id: guard
+        env:
+          FEED_URL: ${{ vars.FEED_URL }}
+          MAX_REMOVED: ${{ vars.MAX_REMOVED || '100' }}
+        run: python feedguard.py ${{ inputs.decision || 'check' }}
+
+      - name: Save the record
+        run: |
+          git config user.name "FeedGuard"
+          git config user.email "feedguard@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "FeedGuard: ${{ steps.guard.outputs.result }}"
+          git push
+
+      - name: Put the feed live
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          cp public/feed.xml /tmp/feed.xml
+          git checkout --orphan live-feed
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          rm -rf public state.json feedguard.py .github README.md 2>/dev/null || true
+          cp /tmp/feed.xml feed.xml
+          touch .nojekyll
+          git add feed.xml .nojekyll
+          git commit -m "Feed: ${{ steps.guard.outputs.count }} products"
+          git push --force origin live-feed
+
+      - name: Ask what to do
+        if: steps.guard.outputs.result == 'asked'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Feed lost ${{ steps.guard.outputs.removed }} products - decision needed" \
+            --body "Your feed dropped from **${{ steps.guard.outputs.baseline }}** to **${{ steps.guard.outputs.count }}** products.
+
+          **Nothing has been published.** Google is still being served the last good file with ${{ steps.guard.outputs.baseline }} products.
+
+          ### Did you remove these on purpose?
+
+          Go to the [Actions tab](../../actions/workflows/feedguard.yml), click **Run workflow**, and choose:
+
+          - **trust** — yes, intentional. Publishes the smaller feed and makes it the new normal.
+          - **keep** — no, something is broken. Keeps serving the old feed until yours recovers.
+
+          Close this issue once you have decided."
+
+      - name: Report a broken feed
+        if: steps.guard.outputs.result == 'download_failed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Feed could not be downloaded" \
+            --body "FeedGuard could not read your feed.
+
+          \`\`\`
+          ${{ steps.guard.outputs.detail }}
+          \`\`\`
+
+          Google is still being served the last good file. No action needed if this clears on the next run in 2 hours."
