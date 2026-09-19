@@ -22,6 +22,9 @@ ID_TAG = f"{{{GNS}}}id"
 
 FEED_URL = os.environ.get("FEED_URL", "")
 MAX_REMOVED = int(os.environ.get("MAX_REMOVED", "100"))
+USER_AGENT = os.environ.get("USER_AGENT") or (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 STATE_FILE = Path("state.json")
 OUTPUT_DIR = Path("public")
@@ -52,11 +55,24 @@ def publish(xml_bytes):
 
 
 def fetch_feed(url, attempts=3):
+    """
+    Some hosts block unrecognised clients with a 403. USER_AGENT can be set as
+    a repository variable to work around an over-eager firewall on your own site.
+    """
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/xml,text/xml,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     last = None
     for _ in range(attempts):
         try:
-            r = requests.get(url, timeout=300,
-                             headers={"User-Agent": "FeedGuard/1.0"})
+            r = requests.get(url, timeout=300, headers=headers)
+            if r.status_code == 403:
+                raise requests.RequestException(
+                    "403 Forbidden - the website is blocking this request. "
+                    "Ask your developer to allow the feed file, or set a "
+                    "USER_AGENT repository variable.")
             r.raise_for_status()
             return r.content
         except requests.RequestException as exc:
