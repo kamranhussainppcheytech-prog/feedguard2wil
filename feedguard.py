@@ -13,6 +13,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 from lxml import etree
@@ -54,29 +55,90 @@ def publish(xml_bytes):
     OUTPUT_FILE.write_bytes(xml_bytes)
 
 
+def _site_root(url):
+    parts = urlsplit(url)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}/"
+    return None
+
+
+def _diagnose_block(response):
+    """
+    A refused request comes back with a page, and that page usually names who
+    refused it. Read the evidence instead of guessing. Note: Cloudflare rewrites
+    the Server header on everything it proxies, so the body is what tells a
+    Cloudflare-made block apart from one made by the website behind it.
+    """
+    headers = {k.lower(): v for k, v in response.headers.items()}
+    try:
+        body = response.text[:8000]
+    except Exception:
+        body = ""
+    low = body.lower()
+    via_cloudflare = "cf-ray" in headers
+    folder = "/wp-content/uploads/woo-feed/"
+
+    if ("challenge" in headers.get("cf-mitigated", "").lower()
+            or "just a moment" in low or "cf-chl" in low or "cf_chl" in low
+            or "challenge-platform" in low):
+        who = "Cloudflare bot challenge"
+        fix = (f"In Cloudflare for this domain, check Security > Bots (Bot Fight Mode), "
+               f"or add a custom rule that skips bot protection for {folder}")
+    elif via_cloudflare and ("cf-error-details" in low or "cf-wrapper" in low
+                             or "sorry, you have been blocked" in low
+                             or "cloudflare ray id" in low):
+        who = "Cloudflare firewall"
+        fix = (f"Check Cloudflare Security > Events for this domain and allow {folder}")
+    elif "wordfence" in low or "your access to this site has been limited" in low:
+        who = "Wordfence (WordPress security plugin)"
+        fix = (f"In WordPress, Wordfence > Firewall > Allowlisted URLs: allow {folder} "
+               f"- Wordfence > Tools > Live Traffic shows the blocked request")
+    elif "mod_security" in low or "modsecurity" in low:
+        who = "ModSecurity (hosting server firewall)"
+        fix = f"The developer or hosting company must allow {folder} in ModSecurity"
+    else:
+        who = "the website server itself"
+        if via_cloudflare:
+            who += " (Cloudflare passed the request through - the block is behind it)"
+        fix = (f"The developer should check .htaccess, security plugins and the "
+               f"hosting firewall for rules affecting {folder}")
+
+    page = re.sub(r"<[^>]+>", " ", body)
+    page = re.sub(r"\s+", " ", page).strip()[:160] or "(empty page)"
+    return (f"HTTP {response.status_code} - blocked by {who}. "
+            f"Page said: {page} -- FIX: {fix}")
+
+
 def fetch_feed(url, attempts=3):
     """
-    Some hosts block unrecognised clients with a 403. USER_AGENT can be set as
-    a repository variable to work around an over-eager firewall on your own site.
+    Some hosts block unrecognised clients. USER_AGENT can be set as a repository
+    variable. A deliberate refusal (401/403/429) is not retried - repeating it
+    changes nothing - it is diagnosed instead.
     """
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/xml,text/xml,*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
+    root = _site_root(url)
+    if root:
+        headers["Referer"] = root
+
     last = None
     for _ in range(attempts):
         try:
             r = requests.get(url, timeout=300, headers=headers)
-            if r.status_code == 403:
-                raise requests.RequestException(
-                    "403 Forbidden - the website is blocking this request. "
-                    "Ask your developer to allow the feed file, or set a "
-                    "USER_AGENT repository variable.")
-            r.raise_for_status()
-            return r.content
         except requests.RequestException as exc:
             last = exc
+            continue
+        if r.status_code in (401, 403, 429):
+            raise RuntimeError(_diagnose_block(r))
+        try:
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            last = exc
+            continue
+        return r.content
     raise RuntimeError(f"could not download the feed after {attempts} tries: {last}")
 
 
@@ -176,7 +238,11 @@ def emit(**outputs):
         return
     with open(path, "a") as fh:
         for key, value in outputs.items():
-            fh.write(f"{key}={value}\n")
+            # One line only, and no characters that could break the shell
+            # command the workflow builds from these values.
+            clean = re.sub(r"[\r\n]+", " ", str(value))
+            clean = re.sub(r'[`"$\\]', "", clean)
+            fh.write(f"{key}={clean}\n")
 
 
 # --------------------------------------------------------------------------
